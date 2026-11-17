@@ -1,0 +1,11 @@
+[package]
+name = "latex_ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+csv.workspace = true
+regex.workspace = true
+uuid.workspace = true

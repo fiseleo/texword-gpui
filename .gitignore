@@ -1,0 +1,21 @@
+# Rust / Cargo
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Local machine Cargo override (e.g. local SSD target-dir when repo lives on SMB share)
+.cargo/config.toml
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# LaTeX build artifacts if testing locally
+*.aux
+*.log
+*.pdf
+*.xdv
+*.synctex.gz
