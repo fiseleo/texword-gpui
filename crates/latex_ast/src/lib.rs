@@ -60,4 +60,31 @@ mod tests {
         let reparsed = parse_latex(&serialized);
         assert_eq!(doc.blocks.len(), reparsed.blocks.len());
     }
+
+    #[test]
+    fn unclosed_environment_does_not_hang() {
+        let incomplete = "\\begin{example}[未完成]\n測試打字中";
+        let doc = parse_latex(incomplete);
+        assert_eq!(doc.blocks.len(), 1);
+
+        let incomplete_math = "\\[\nF = ma";
+        let doc2 = parse_latex(incomplete_math);
+        assert_eq!(doc2.blocks.len(), 1);
+    }
+
+    #[test]
+    fn parses_real_manuscript_if_present() {
+        let root = std::path::Path::new(r"z:\書\書稿");
+        if !root.join("main.tex").exists() {
+            return;
+        }
+        let proj = BookProject::open(root).expect("failed to open manuscript");
+        assert!(!proj.chapters.is_empty());
+        for ch in &proj.chapters {
+            let (_, doc) = proj
+                .load_chapter(&ch.relative_path)
+                .expect("failed to load chapter");
+            assert!(!doc.blocks.is_empty(), "empty chapter: {}", ch.relative_path);
+        }
+    }
 }

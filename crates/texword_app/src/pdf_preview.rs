@@ -1,6 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+fn hidden_command(exe: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
 /// Locate directory containing Poppler `pdftoppm` and `pdfinfo` (PATH or MiKTeX bin dir).
 pub fn find_poppler_bin_dir() -> Option<PathBuf> {
     let exe_name = if cfg!(target_os = "windows") {
@@ -50,7 +60,7 @@ pub fn get_pdf_page_count(pdf_path: &Path) -> Result<usize, String> {
     } else {
         "pdfinfo"
     });
-    let out = Command::new(exe)
+    let out = hidden_command(&exe)
         .arg(pdf_path)
         .output()
         .map_err(|e| format!("無法執行 pdfinfo：{e}"))?;
@@ -93,7 +103,7 @@ pub fn render_pdf_page_png(pdf_path: &Path, page: usize, dpi: u32) -> Result<Vec
     let prefix = std::env::temp_dir().join(&unique);
     let png_path = std::env::temp_dir().join(format!("{unique}.png"));
 
-    let out = Command::new(exe)
+    let out = hidden_command(&exe)
         .args([
             "-png",
             "-singlefile",

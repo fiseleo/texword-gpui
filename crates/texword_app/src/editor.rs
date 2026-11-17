@@ -325,7 +325,10 @@ impl TexWordEditor {
                             .figure_thumbs
                             .insert(key, Arc::new(Image::from_bytes(fmt, bytes)));
                     }
-                    editor.doc_list_state.reset(editor.document.blocks.len());
+                    let n = editor.document.blocks.len();
+                    if n > 0 {
+                        editor.doc_list_state.splice(0..n, n);
+                    }
                     cx.notify();
                 });
             }
@@ -1632,11 +1635,13 @@ fn render_block_visual(
             let is_layout_env = matches!(env, "flushright" | "center" | "titlepage" | "quote");
             let has_todo = raw.contains("\\todo") || raw.contains("\\needcite");
             if is_layout_env {
-                let inner_lines: Vec<&str> = raw
-                    .lines()
-                    .skip(1)
-                    .take_while(|l| !l.trim().starts_with("\\end{"))
-                    .collect();
+                let mut inner_lines: Vec<&str> = raw.lines().skip(1).collect();
+                if inner_lines
+                    .last()
+                    .is_some_and(|l| l.trim().starts_with("\\end{"))
+                {
+                    inner_lines.pop();
+                }
                 let inner_doc = parse_latex(&inner_lines.join("\n"));
                 return div()
                     .w_full()

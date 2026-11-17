@@ -14,6 +14,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
     let mut i = 0;
 
     while i < lines.len() {
+        let prev_i = i;
         let trimmed = lines[i].trim();
 
         // Skip empty separator lines
@@ -121,6 +122,13 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
                 blocks.push(Block::new(block_kind));
                 i = end_line + 1;
                 continue;
+            } else {
+                // Unclosed \begin{env} (e.g., while user is typing live): preserve without looping
+                blocks.push(Block::new(BlockKind::RawLatex {
+                    env_name: Some(env_name),
+                    raw: lines[start_idx..].join("\n"),
+                }));
+                break;
             }
         }
 
@@ -138,6 +146,15 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             }
             para_lines.push(lines[i]);
             i += 1;
+        }
+        if i == prev_i {
+            // Guaranteed progress invariant on malformed lines
+            blocks.push(Block::new(BlockKind::RawLatex {
+                env_name: None,
+                raw: lines[i].to_string(),
+            }));
+            i += 1;
+            continue;
         }
         let joined = para_lines.join("\n");
         let inlines = parse_inlines(&joined);
