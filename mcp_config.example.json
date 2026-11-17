@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "texword-gpui-live": {
+      "url": "http://127.0.0.1:3847/mcp"
+    },
+    "texword-gpui-stdio": {
+      "command": "C:\\Users\\CHU YU TA\\.cache\\texword-gpui\\target\\release\\texword_app.exe",
+      "args": ["--mcp-stdio", "--project", "z:\\書\\書稿"]
+    }
+  }
+}

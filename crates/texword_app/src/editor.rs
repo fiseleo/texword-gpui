@@ -4,10 +4,10 @@ use crate::{
     theme::BookPalette,
 };
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontStyle, FontWeight, HighlightStyle, Image,
-    ImageFormat, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage as _, StyledText, Subscription,
-    Window, div, img, list, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, FocusHandle, FontStyle, FontWeight,
+    HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement, ListAlignment, ListState,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage as _,
+    StyledText, Subscription, Window, actions, div, img, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Sizable as _,
@@ -21,10 +21,13 @@ use latex_ast::{
 };
 use math_preview::{format_chem_unicode, math_to_plain_text, parse_math};
 use mcp_server::{EditorSharedState, EditorSyncEvent, run_latex_build};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
+
+actions!(texword, [SaveFile]);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
@@ -59,6 +62,8 @@ pub struct TexWordEditor {
     pdf_loading: bool,
     pdf_error: Option<String>,
     toc_pages: Vec<(String, usize)>,
+    figure_thumbs: HashMap<String, Arc<Image>>,
+    focus_handle: FocusHandle,
     status_message: String,
     _sync_task: gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -174,8 +179,10 @@ impl TexWordEditor {
             pdf_loading: false,
             pdf_error: None,
             toc_pages,
+            figure_thumbs: HashMap::new(),
+            focus_handle: cx.focus_handle(),
             status_message:
-                "就緒：左側選章節、中央滾輪瀏覽與即時編輯、右側即時檢視 PDF 排版預覽。"
+                "就緒：左側選章節、中央滾輪瀏覽與即時編輯（Ctrl+S 存檔）、右側即時檢視 PDF 排版預覽。"
                     .to_string(),
             _sync_task: sync_task,
             _subscriptions: vec![edit_sub, page_sub],
@@ -184,6 +191,7 @@ impl TexWordEditor {
         editor.jump_pdf_to_current_chapter();
         editor.sync_pdf_page_input(window, cx);
         editor.refresh_pdf_preview(true, cx);
+        editor.load_figure_thumbnails(cx);
         editor
     }
 
@@ -247,7 +255,109 @@ impl TexWordEditor {
         self.jump_pdf_to_current_chapter();
         self.sync_pdf_page_input(window, cx);
         self.refresh_pdf_preview(false, cx);
+        self.load_figure_thumbnails(cx);
         cx.notify();
+    }
+
+    fn load_figure_thumbnails(&mut self, cx: &mut Context<Self>) {
+        let root_dir = {
+            let guard = self.shared.blocking_read();
+            guard.project.as_ref().map(|p| p.root_dir.clone())
+        };
+        let Some(root) = root_dir else {
+            return;
+        };
+        let mut fig_paths = Vec::new();
+        for b in &self.document.blocks {
+            if let BlockKind::Figure { path: Some(p), .. } = &b.kind {
+                if !self.figure_thumbs.contains_key(p) {
+                    fig_paths.push(p.clone());
+                }
+            }
+        }
+        if fig_paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for rel in fig_paths {
+                        let candidates = [
+                            root.join("figures/out").join(format!("{rel}.pdf")),
+                            root.join("figures/out").join(&rel),
+                            root.join(&rel),
+                        ];
+                        for cand in candidates {
+                            if !cand.is_file() {
+                                continue;
+                            }
+                            let ext = cand
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            if ext == "pdf" {
+                                if let Ok(bytes) = render_pdf_page_png(&cand, 1, 110) {
+                                    out.push((rel, ImageFormat::Png, bytes));
+                                    break;
+                                }
+                            } else if let Ok(bytes) = std::fs::read(&cand) {
+                                let fmt = match ext.as_str() {
+                                    "jpg" | "jpeg" => ImageFormat::Jpeg,
+                                    "webp" => ImageFormat::Webp,
+                                    _ => ImageFormat::Png,
+                                };
+                                out.push((rel, fmt, bytes));
+                                break;
+                            }
+                        }
+                    }
+                    out
+                })
+                .await;
+
+            if !rendered.is_empty() {
+                let _ = this.update(cx, |editor, cx| {
+                    for (key, fmt, bytes) in rendered {
+                        editor
+                            .figure_thumbs
+                            .insert(key, Arc::new(Image::from_bytes(fmt, bytes)));
+                    }
+                    editor.doc_list_state.reset(editor.document.blocks.len());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn jump_to_issue(&mut self, issue: &TermIssue, cx: &mut Context<Self>) {
+        let needle = issue.matched.trim();
+        let ctx_needle: String = issue.context.chars().take(24).collect();
+        let target_idx = self.document.blocks.iter().position(|b| {
+            let raw = serialize_block(b);
+            (!needle.is_empty() && raw.contains(needle))
+                || (!ctx_needle.is_empty() && raw.contains(&ctx_needle))
+        });
+
+        if let Some(idx) = target_idx {
+            self.selected_block = Some(idx);
+            self.editing_block = None;
+            self.doc_list_state.splice(idx..idx + 1, 1);
+            self.doc_list_state.scroll_to_reveal_item(idx);
+            self.status_message = format!(
+                "已定位至區塊 #{}（{} 第 {} 行）",
+                idx + 1,
+                issue.kind,
+                issue.line
+            );
+            cx.notify();
+        } else {
+            self.status_message = format!("無法定位至第 {} 行：{}", issue.line, issue.matched);
+            cx.notify();
+        }
     }
 
     fn jump_pdf_to_current_chapter(&mut self) {
@@ -979,13 +1089,20 @@ impl TexWordEditor {
                                         .child("目前章節未發現 terms.csv 避免用詞、\\todo 或 \\needcite。"),
                                 )
                             } else {
-                                el.children(self.term_issues.iter().map(|issue| {
+                                el.children(self.term_issues.iter().enumerate().map(|(i, issue)| {
+                                    let issue_clone = issue.clone();
                                     div()
+                                        .id(SharedString::from(format!("issue-{i}")))
                                         .p(px(8.0))
                                         .rounded(px(6.0))
                                         .bg(BookPalette::paper_bg())
                                         .border_1()
                                         .border_color(BookPalette::border())
+                                        .cursor_pointer()
+                                        .hover(|h| h.bg(BookPalette::accent_soft()))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.jump_to_issue(&issue_clone, cx);
+                                        }))
                                         .flex()
                                         .flex_col()
                                         .gap(px(3.0))
@@ -994,7 +1111,7 @@ impl TexWordEditor {
                                                 .text_size(px(11.5))
                                                 .text_color(BookPalette::warn())
                                                 .child(format!(
-                                                    "[{}] 第 {} 行：{}",
+                                                    "[{}] 第 {} 行：{}（點擊跳轉）",
                                                     issue.kind, issue.line, issue.matched
                                                 )),
                                         )
@@ -1141,7 +1258,7 @@ impl TexWordEditor {
                         .children(
                             self.live_preview_blocks
                                 .iter()
-                                .map(|b| render_block_visual(&b.kind, false)),
+                                .map(|b| render_block_visual(&b.kind, false, &self.figure_thumbs)),
                         ),
                 )
                 .child(
@@ -1214,7 +1331,7 @@ impl TexWordEditor {
                     this.start_editing_block(idx, window, cx);
                 }
             }))
-            .child(render_block_visual(&block.kind, is_expanded))
+            .child(render_block_visual(&block.kind, is_expanded, &self.figure_thumbs))
             .into_any_element()
     }
 }
@@ -1222,6 +1339,10 @@ impl TexWordEditor {
 impl Render for TexWordEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &SaveFile, _, cx| {
+                this.save_active_file(cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -1260,7 +1381,11 @@ impl Render for TexWordEditor {
     }
 }
 
-fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
+fn render_block_visual(
+    kind: &BlockKind,
+    expanded_raw: bool,
+    figure_thumbs: &HashMap<String, Arc<Image>>,
+) -> AnyElement {
     match kind {
         BlockKind::Heading {
             level,
@@ -1364,7 +1489,11 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                         .text_color(accent)
                         .child(header),
                 )
-                .children(blocks.iter().map(|b| render_block_visual(&b.kind, false)))
+                .children(
+                    blocks
+                        .iter()
+                        .map(|b| render_block_visual(&b.kind, false, figure_thumbs)),
+                )
                 .into_any_element()
         }
         BlockKind::Figure {
@@ -1374,68 +1503,89 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
             label,
             has_tikzpicture,
             raw,
-        } => div()
-            .w_full()
-            .p(px(12.0))
-            .rounded(px(6.0))
-            .bg(BookPalette::math_bg())
-            .border_1()
-            .border_color(BookPalette::border())
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(BookPalette::accent())
-                            .child(if *has_tikzpicture {
-                                "圖表區塊（內嵌 TikZ 向量圖 — 點擊展開 / 再點編輯）"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "圖表區塊：{}",
-                                    path.as_deref().unwrap_or("未指定圖檔")
-                                )
-                            }),
-                    )
-                    .when_some(label.clone(), |el, l| {
-                        el.child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(BookPalette::text_muted())
-                                .child(l),
-                        )
-                    }),
-            )
-            .when_some(caption.clone(), |el, cap| {
-                el.child(
+        } => {
+            let thumb = path.as_ref().and_then(|p| figure_thumbs.get(p).cloned());
+            div()
+                .w_full()
+                .p(px(12.0))
+                .rounded(px(6.0))
+                .bg(BookPalette::math_bg())
+                .border_1()
+                .border_color(BookPalette::border())
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
                     div()
-                        .text_size(px(13.0))
-                        .text_color(BookPalette::text_main())
-                        .child(match source {
-                            Some(src) => format!("圖說：{cap}（來源：{src}）"),
-                            None => format!("圖說：{cap}"),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(BookPalette::accent())
+                                .child(if *has_tikzpicture {
+                                    "圖表區塊（內嵌 TikZ 向量圖 — 點擊展開 / 再點編輯）"
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "圖表區塊：{}",
+                                        path.as_deref().unwrap_or("未指定圖檔")
+                                    )
+                                }),
+                        )
+                        .when_some(label.clone(), |el, l| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(BookPalette::text_muted())
+                                    .child(l),
+                            )
                         }),
                 )
-            })
-            .when(expanded_raw, |el| {
-                el.child(
-                    div()
-                        .p(px(8.0))
-                        .rounded(px(4.0))
-                        .bg(BookPalette::paper_bg())
-                        .text_size(px(11.5))
-                        .text_color(BookPalette::text_muted())
-                        .child(raw.clone()),
-                )
-            })
-            .into_any_element(),
+                .when_some(thumb, |el, t| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .bg(BookPalette::paper_bg())
+                            .rounded(px(4.0))
+                            .p(px(6.0))
+                            .child(
+                                img(t)
+                                    .w(px(520.0))
+                                    .max_w_full()
+                                    .h(px(260.0))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
+                    )
+                })
+                .when_some(caption.clone(), |el, cap| {
+                    el.child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(BookPalette::text_main())
+                            .child(match source {
+                                Some(src) => format!("圖說：{cap}（來源：{src}）"),
+                                None => format!("圖說：{cap}"),
+                            }),
+                    )
+                })
+                .when(expanded_raw, |el| {
+                    el.child(
+                        div()
+                            .p(px(8.0))
+                            .rounded(px(4.0))
+                            .bg(BookPalette::paper_bg())
+                            .text_size(px(11.5))
+                            .text_color(BookPalette::text_muted())
+                            .child(raw.clone()),
+                    )
+                })
+                .into_any_element()
+        }
         BlockKind::List { ordered, items } => div()
             .w_full()
             .pl(px(12.0))
@@ -1514,7 +1664,7 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                         inner_doc
                             .blocks
                             .iter()
-                            .map(|b| render_block_visual(&b.kind, false)),
+                            .map(|b| render_block_visual(&b.kind, false, figure_thumbs)),
                     )
                     .when(expanded_raw, |el| {
                         el.child(

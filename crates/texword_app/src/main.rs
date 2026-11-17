@@ -3,8 +3,10 @@ mod math_view;
 mod pdf_preview;
 mod theme;
 
-use editor::TexWordEditor;
-use gpui::{App, AppContext as _, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
+use editor::{SaveFile, TexWordEditor};
+use gpui::{
+    App, AppContext as _, Bounds, KeyBinding, QuitMode, WindowBounds, WindowOptions, px, size,
+};
 use gpui_component::Root;
 use mcp_server::{EditorSharedState, serve_http, serve_stdio};
 use std::net::SocketAddr;
@@ -70,6 +72,10 @@ fn main() -> anyhow::Result<()> {
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-s", SaveFile, None),
+                KeyBinding::new("cmd-s", SaveFile, None),
+            ]);
 
             let bounds = Bounds::centered(None, size(px(1420.0), px(900.0)), cx);
             let options = WindowOptions {
