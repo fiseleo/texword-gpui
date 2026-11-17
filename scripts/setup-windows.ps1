@@ -8,7 +8,7 @@ Write-Host "=== 1. Check / Install Rust (rustup) ===" -ForegroundColor Cyan
 $cargoExe = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
 if (-not (Test-Path $cargoExe)) {
     $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
-    Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile $rustupInit
+    curl.exe -fL "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -o $rustupInit
     & $rustupInit -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
 } else {
     Write-Host "Rust already installed: $(& $cargoExe --version)" -ForegroundColor Green
@@ -28,7 +28,7 @@ if (Test-Path $vsWhere) {
 if (-not $hasVcTools) {
     $vsExe = Join-Path $env:TEMP "vs_BuildTools.exe"
     Write-Host "Downloading Visual Studio Build Tools..." -ForegroundColor Yellow
-    Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_BuildTools.exe" -OutFile $vsExe
+    curl.exe -fL "https://aka.ms/vs/17/release/vs_BuildTools.exe" -o $vsExe
     Write-Host "Launching installer (accept UAC prompt to install C++ Build Tools + Windows SDK)..." -ForegroundColor Yellow
     $args = @(
         "--add", "Microsoft.VisualStudio.Workload.VCTools",
