@@ -14,12 +14,22 @@ if (Test-Path $xelatexExe) {
 }
 
 $installer = Join-Path $env:TEMP "basic-miktex-25.12-x64.exe"
-$url = "https://miktex.org/download/ctan/systems/win32/miktex/setup/windows-x64/basic-miktex-25.12-x64.exe"
-Write-Host "Downloading MiKTeX (~142 MB)..." -ForegroundColor Cyan
-curl.exe -fL $url -o $installer
+$url = "https://mirrors.ctan.org/systems/win32/miktex/setup/windows-x64/basic-miktex-25.12-x64.exe"
+if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 100MB) {
+    Write-Host "Downloading MiKTeX (~142 MB) from CTAN mirror..." -ForegroundColor Cyan
+    curl.exe -fL --retry 3 $url -o $installer
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $installer)) {
+        throw "Failed to download MiKTeX installer from $url"
+    }
+} else {
+    Write-Host "Using cached installer: $installer" -ForegroundColor Green
+}
 
 Write-Host "Installing MiKTeX for current user (auto-install packages enabled)..." -ForegroundColor Cyan
-& $installer --unattended --auto-install=yes --shared=no
+$proc = Start-Process -FilePath $installer -ArgumentList "--unattended --private --auto-install=yes" -Wait -PassThru
+if ($proc.ExitCode -ne 0) {
+    throw "MiKTeX installer exited with code $($proc.ExitCode)"
+}
 
 if (Test-Path $xelatexExe) {
     Write-Host "Installed XeLaTeX at: $xelatexExe" -ForegroundColor Green
