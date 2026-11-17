@@ -7,5 +7,4 @@ edition.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 csv.workspace = true
-regex.workspace = true
 uuid.workspace = true

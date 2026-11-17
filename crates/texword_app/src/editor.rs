@@ -1,15 +1,16 @@
 use crate::{math_view::render_math_tex, theme::BookPalette};
 use gpui::{
-    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Textarea, TextareaState},
 };
 use latex_ast::{
-    Block, BlockKind, CalloutKind, ChapterEntry, Document, HeadingLevel, Inline, MathEnv,
-    TermIssue, parse_latex, serialize_block, serialize_latex,
+    Block, BlockKind, CalloutKind, ChapterEntry, Document, HeadingLevel, Inline, TermIssue,
+    parse_latex, serialize_block, serialize_latex,
 };
 use math_preview::format_chem_unicode;
 use mcp_server::{EditorSharedState, EditorSyncEvent};
