@@ -1418,34 +1418,93 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
             .text_color(BookPalette::text_muted())
             .child(lines.join("\n"))
             .into_any_element(),
-        BlockKind::RawLatex { env_name, raw } => div()
-            .w_full()
-            .p(px(10.0))
-            .rounded(px(6.0))
-            .bg(BookPalette::sidebar_bg())
-            .border_1()
-            .border_color(BookPalette::border())
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(BookPalette::accent())
-                    .child(format!(
-                        "原樣保留區塊 [{}]（點擊展開 / 再點編輯）",
-                        env_name.as_deref().unwrap_or("LaTeX")
-                    )),
-            )
-            .when(expanded_raw, |el| {
-                el.child(
+        BlockKind::RawLatex { env_name, raw } => {
+            let env = env_name.as_deref().unwrap_or("LaTeX");
+            let is_layout_env = matches!(env, "flushright" | "center" | "titlepage" | "quote");
+            let has_todo = raw.contains("\\todo") || raw.contains("\\needcite");
+            if is_layout_env {
+                let inner_lines: Vec<&str> = raw
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| !l.trim().starts_with("\\end{"))
+                    .collect();
+                let inner_doc = parse_latex(&inner_lines.join("\n"));
+                return div()
+                    .w_full()
+                    .p(px(10.0))
+                    .rounded(px(6.0))
+                    .bg(BookPalette::sidebar_bg())
+                    .border_1()
+                    .border_color(if has_todo {
+                        BookPalette::todo_red()
+                    } else {
+                        BookPalette::border()
+                    })
+                    .flex()
+                    .flex_col()
+                    .when(env == "flushright", |el| el.items_end())
+                    .when(matches!(env, "center" | "titlepage"), |el| el.items_center())
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(BookPalette::text_muted())
+                            .child(format!("[{env}]")),
+                    )
+                    .children(
+                        inner_doc
+                            .blocks
+                            .iter()
+                            .map(|b| render_block_visual(&b.kind, false)),
+                    )
+                    .when(expanded_raw, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .pt(px(4.0))
+                                .text_size(px(11.5))
+                                .text_color(BookPalette::text_muted())
+                                .child(raw.clone()),
+                        )
+                    })
+                    .into_any_element();
+            }
+
+            let preview_lines: String = raw.lines().take(3).collect::<Vec<_>>().join("\n");
+            div()
+                .w_full()
+                .p(px(10.0))
+                .rounded(px(6.0))
+                .bg(BookPalette::sidebar_bg())
+                .border_1()
+                .border_color(if has_todo {
+                    BookPalette::todo_red()
+                } else {
+                    BookPalette::border()
+                })
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(BookPalette::accent())
+                        .child(format!(
+                            "原樣保留區塊 [{env}]（點擊展開完整碼 / 再點編輯）"
+                        )),
+                )
+                .child(
                     div()
                         .text_size(px(11.5))
                         .text_color(BookPalette::text_muted())
-                        .child(raw.clone()),
+                        .child(if expanded_raw {
+                            raw.clone()
+                        } else {
+                            preview_lines
+                        }),
                 )
-            })
-            .into_any_element(),
+                .into_any_element()
+        }
     }
 }
 
@@ -1585,7 +1644,7 @@ fn collect_inline_runs(
             }
             Inline::Todo { text } => {
                 let start = out.len();
-                out.push_str(&format!("[TODO: {text}]"));
+                out.push_str(&format!("［待補：{text}］"));
                 highlights.push((
                     start..out.len(),
                     HighlightStyle {
@@ -1598,7 +1657,7 @@ fn collect_inline_runs(
             }
             Inline::NeedCite => {
                 let start = out.len();
-                out.push_str("[待補引用]");
+                out.push_str("［待查出處］");
                 highlights.push((
                     start..out.len(),
                     HighlightStyle {
