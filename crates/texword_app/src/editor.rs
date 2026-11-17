@@ -1,13 +1,17 @@
-use crate::{math_view::render_math_tex, theme::BookPalette};
+use crate::{
+    math_view::render_math_tex,
+    pdf_preview::{estimate_chapter_pdf_pages, get_pdf_page_count, render_pdf_page_png},
+    theme::BookPalette,
+};
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div, list,
-    prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, FontStyle, FontWeight, HighlightStyle, Image,
+    ImageFormat, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage as _, StyledText, Subscription,
+    Window, div, img, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
-    input::{Textarea, TextareaState},
+    input::{InputEvent, Textarea, TextareaState},
     scroll::{ScrollableElement as _, Scrollbar},
 };
 use latex_ast::{
@@ -23,6 +27,7 @@ use tokio::sync::{RwLock, broadcast};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
+    Preview,
     Terms,
     Mcp,
 }
@@ -38,12 +43,23 @@ pub struct TexWordEditor {
     selected_block: Option<usize>,
     editing_block: Option<usize>,
     edit_textarea: Entity<TextareaState>,
+    live_preview_blocks: Vec<Block>,
     expanded_raw: std::collections::HashSet<String>,
+    show_right_panel: bool,
     right_tab: RightTab,
     term_issues: Vec<TermIssue>,
     mcp_logs: Vec<String>,
+    pdf_path: Option<PathBuf>,
+    pdf_page: usize,
+    pdf_total_pages: usize,
+    pdf_dpi: u32,
+    pdf_image: Option<Arc<Image>>,
+    pdf_loading: bool,
+    pdf_error: Option<String>,
+    toc_pages: Vec<(String, usize)>,
     status_message: String,
     _sync_task: gpui::Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TexWordEditor {
@@ -54,23 +70,41 @@ impl TexWordEditor {
         cx: &mut Context<Self>,
     ) -> Self {
         let edit_textarea = cx.new(|cx| TextareaState::new(window, cx));
+        let edit_sub = cx.subscribe(&edit_textarea, |this, state, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) && this.editing_block.is_some() {
+                let text = state.read(cx).value().to_string();
+                this.live_preview_blocks = parse_latex(&text).blocks;
+                cx.notify();
+            }
+        });
 
-        let (chapters, active_chapter, document, dirty, mcp_logs, mut rx) = {
+        let (chapters, active_chapter, document, dirty, mcp_logs, root_dir, mut rx) = {
             let guard = shared.blocking_read();
             let chapters = guard
                 .project
                 .as_ref()
                 .map(|p| p.chapters.clone())
                 .unwrap_or_default();
+            let root_dir = guard.project.as_ref().map(|p| p.root_dir.clone());
             (
                 chapters,
                 guard.active_chapter.clone(),
                 guard.document.clone(),
                 guard.dirty,
                 guard.mcp_logs.clone(),
+                root_dir,
                 guard.events_tx.subscribe(),
             )
         };
+
+        let pdf_path = root_dir
+            .as_ref()
+            .map(|r| r.join("main.pdf"))
+            .filter(|p| p.exists());
+        let toc_pages = root_dir
+            .as_ref()
+            .map(|r| estimate_chapter_pdf_pages(r))
+            .unwrap_or_default();
 
         let doc_list_state =
             ListState::new(document.blocks.len(), ListAlignment::Top, px(480.0));
@@ -116,16 +150,29 @@ impl TexWordEditor {
             selected_block: None,
             editing_block: None,
             edit_textarea,
+            live_preview_blocks: Vec::new(),
             expanded_raw: std::collections::HashSet::new(),
-            right_tab: RightTab::Terms,
+            show_right_panel: true,
+            right_tab: RightTab::Preview,
             term_issues: Vec::new(),
             mcp_logs,
+            pdf_path,
+            pdf_page: 1,
+            pdf_total_pages: 1,
+            pdf_dpi: 130,
+            pdf_image: None,
+            pdf_loading: false,
+            pdf_error: None,
+            toc_pages,
             status_message:
-                "就緒：滾輪上下滑動閱讀整章，點擊任一段落或公式即可像 Word 一樣編輯。"
+                "就緒：左側選章節、中央滾輪瀏覽與即時編輯、右側即時檢視 PDF 排版預覽。"
                     .to_string(),
             _sync_task: sync_task,
+            _subscriptions: vec![edit_sub],
         };
         editor.refresh_term_issues();
+        editor.jump_pdf_to_current_chapter();
+        editor.refresh_pdf_preview(true, cx);
         editor
     }
 
@@ -186,7 +233,93 @@ impl TexWordEditor {
         }
         drop(guard);
         self.refresh_term_issues();
+        self.jump_pdf_to_current_chapter();
+        self.refresh_pdf_preview(false, cx);
         cx.notify();
+    }
+
+    fn jump_pdf_to_current_chapter(&mut self) {
+        let Some(active) = self.active_chapter.as_deref() else {
+            return;
+        };
+        let title = self
+            .chapters
+            .iter()
+            .find(|c| c.relative_path == active)
+            .map(|c| c.title.as_str())
+            .unwrap_or("");
+        if title.is_empty() {
+            return;
+        }
+        if let Some((_, page)) = self.toc_pages.iter().find(|(t, _)| t.contains(title)) {
+            self.pdf_page = (*page).max(1);
+        }
+    }
+
+    fn set_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let total = self.pdf_total_pages.max(1);
+        self.pdf_page = page.clamp(1, total);
+        self.refresh_pdf_preview(false, cx);
+    }
+
+    fn refresh_pdf_preview(&mut self, recount_pages: bool, cx: &mut Context<Self>) {
+        let Some(pdf_path) = self.pdf_path.clone() else {
+            self.pdf_error = Some("專案目錄下尚未產生 main.pdf（可先按「XeLaTeX 快速編譯」生成）".to_string());
+            self.pdf_image = None;
+            cx.notify();
+            return;
+        };
+        if !pdf_path.exists() {
+            self.pdf_error = Some("找不到 main.pdf".to_string());
+            self.pdf_image = None;
+            cx.notify();
+            return;
+        }
+
+        let target_page = self.pdf_page.max(1);
+        let dpi = self.pdf_dpi;
+        self.pdf_loading = true;
+        self.pdf_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let total = if recount_pages {
+                        get_pdf_page_count(&pdf_path).ok()
+                    } else {
+                        None
+                    };
+                    let page = match total {
+                        Some(t) => target_page.clamp(1, t),
+                        None => target_page,
+                    };
+                    let png = render_pdf_page_png(&pdf_path, page, dpi);
+                    (total, page, png)
+                })
+                .await;
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.pdf_loading = false;
+                if let Some(t) = res.0 {
+                    editor.pdf_total_pages = t;
+                }
+                editor.pdf_page = res.1;
+                match res.2 {
+                    Ok(bytes) => {
+                        editor.pdf_image =
+                            Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)));
+                        editor.pdf_error = None;
+                    }
+                    Err(e) => {
+                        editor.pdf_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn save_active_file(&mut self, cx: &mut Context<Self>) {
@@ -217,6 +350,7 @@ impl TexWordEditor {
             let raw = serialize_block(block);
             self.selected_block = Some(idx);
             self.editing_block = Some(idx);
+            self.live_preview_blocks = vec![block.clone()];
             self.edit_textarea.update(cx, |state, cx| {
                 state.set_value(raw, window, cx);
             });
@@ -333,6 +467,7 @@ impl TexWordEditor {
                 .spawn(async move { run_latex_build(&root, true) })
                 .await;
 
+            let ok = outcome.success;
             let summary = outcome.summary;
 
             {
@@ -342,6 +477,17 @@ impl TexWordEditor {
             let _ = this.update(cx, |editor, cx| {
                 editor.pull_from_shared(&shared, false);
                 editor.status_message = summary;
+                if ok {
+                    let guard = shared.blocking_read();
+                    if let Some(p) = &guard.project {
+                        editor.pdf_path = Some(p.root_dir.join("main.pdf"));
+                        editor.toc_pages = estimate_chapter_pdf_pages(&p.root_dir);
+                    }
+                    drop(guard);
+                    editor.right_tab = RightTab::Preview;
+                    editor.show_right_panel = true;
+                    editor.refresh_pdf_preview(true, cx);
+                }
                 cx.notify();
             });
         })
@@ -475,6 +621,27 @@ impl TexWordEditor {
                             .secondary()
                             .label("XeLaTeX 快速編譯")
                             .on_click(cx.listener(|this, _, _, cx| this.trigger_compile_quick(cx))),
+                    )
+                    .child(
+                        Button::new("btn-toggle-preview")
+                            .secondary()
+                            .label(if self.show_right_panel && self.right_tab == RightTab::Preview {
+                                "隱藏預覽"
+                            } else {
+                                "PDF 預覽"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.show_right_panel && this.right_tab == RightTab::Preview {
+                                    this.show_right_panel = false;
+                                } else {
+                                    this.show_right_panel = true;
+                                    this.right_tab = RightTab::Preview;
+                                    if this.pdf_image.is_none() {
+                                        this.refresh_pdf_preview(true, cx);
+                                    }
+                                }
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
@@ -557,8 +724,12 @@ impl TexWordEditor {
     }
 
     fn render_right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel_w = match self.right_tab {
+            RightTab::Preview => px(500.0),
+            RightTab::Terms | RightTab::Mcp => px(320.0),
+        };
         div()
-            .w(px(300.0))
+            .w(panel_w)
             .h_full()
             .min_h_0()
             .bg(BookPalette::sidebar_bg())
@@ -573,7 +744,19 @@ impl TexWordEditor {
                     .border_color(BookPalette::border())
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .gap(px(6.0))
+                    .child(
+                        Button::new("tab-preview")
+                            .label("PDF 預覽")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.right_tab = RightTab::Preview;
+                                if this.pdf_image.is_none() {
+                                    this.refresh_pdf_preview(true, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("tab-terms")
                             .label(format!("術語檢查 ({})", self.term_issues.len()))
@@ -591,6 +774,88 @@ impl TexWordEditor {
                             })),
                     ),
             )
+            .when(self.right_tab == RightTab::Preview, |el| {
+                let page = self.pdf_page;
+                let total = self.pdf_total_pages.max(1);
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(BookPalette::border())
+                        .bg(BookPalette::ribbon_bg())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(4.0))
+                        .child(
+                            Button::new("pdf-prev10")
+                                .secondary()
+                                .label("-10")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_pdf_page(page.saturating_sub(10).max(1), cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pdf-prev")
+                                .secondary()
+                                .label("上頁")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_pdf_page(page.saturating_sub(1).max(1), cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .text_size(px(12.0))
+                                .text_color(BookPalette::text_main())
+                                .child(format!("第 {page} / {total} 頁")),
+                        )
+                        .child(
+                            Button::new("pdf-next")
+                                .secondary()
+                                .label("下頁")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_pdf_page((page + 1).min(total), cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pdf-next10")
+                                .secondary()
+                                .label("+10")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_pdf_page((page + 10).min(total), cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pdf-zoom-out")
+                                .secondary()
+                                .label("－")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_dpi = this.pdf_dpi.saturating_sub(25).max(80);
+                                    this.refresh_pdf_preview(false, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pdf-zoom-in")
+                                .secondary()
+                                .label("＋")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_dpi = (this.pdf_dpi + 25).min(220);
+                                    this.refresh_pdf_preview(false, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("pdf-refresh")
+                                .secondary()
+                                .label("重整")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.refresh_pdf_preview(true, cx);
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("right-panel-body")
@@ -602,6 +867,47 @@ impl TexWordEditor {
                     .flex_col()
                     .gap(px(8.0))
                     .map(|el| match self.right_tab {
+                        RightTab::Preview => {
+                            let mut col = el;
+                            if self.pdf_loading {
+                                col = col.child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(BookPalette::accent())
+                                        .child(format!("正在算圖第 {} 頁...", self.pdf_page)),
+                                );
+                            }
+                            if let Some(err) = &self.pdf_error {
+                                col = col.child(
+                                    div()
+                                        .p(px(10.0))
+                                        .rounded(px(6.0))
+                                        .bg(BookPalette::warn_soft())
+                                        .text_size(px(12.0))
+                                        .text_color(BookPalette::warn())
+                                        .child(err.clone()),
+                                );
+                            }
+                            if let Some(image) = &self.pdf_image {
+                                let preview_h = px(650.0 * (self.pdf_dpi as f32 / 130.0));
+                                col = col.child(
+                                    div()
+                                        .w_full()
+                                        .bg(BookPalette::paper_bg())
+                                        .border_1()
+                                        .border_color(BookPalette::border())
+                                        .rounded(px(4.0))
+                                        .p(px(4.0))
+                                        .child(
+                                            img(image.clone())
+                                                .w_full()
+                                                .h(preview_h)
+                                                .object_fit(gpui::ObjectFit::Contain),
+                                        ),
+                                );
+                            }
+                            col
+                        }
                         RightTab::Terms => {
                             if self.term_issues.is_empty() {
                                 el.child(
@@ -758,6 +1064,29 @@ impl TexWordEditor {
                 .child(Textarea::new(&self.edit_textarea).h(px(140.0)))
                 .child(
                     div()
+                        .w_full()
+                        .p(px(10.0))
+                        .rounded(px(4.0))
+                        .bg(BookPalette::paper_bg())
+                        .border_1()
+                        .border_color(BookPalette::border())
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(BookPalette::text_muted())
+                                .child("即時排版預覽（隨輸入同步更新）"),
+                        )
+                        .children(
+                            self.live_preview_blocks
+                                .iter()
+                                .map(|b| render_block_visual(&b.kind, false)),
+                        ),
+                )
+                .child(
+                    div()
                         .flex()
                         .flex_row()
                         .gap(px(8.0))
@@ -847,7 +1176,7 @@ impl Render for TexWordEditor {
                     .flex_row()
                     .child(self.render_sidebar(cx))
                     .child(self.render_canvas(cx))
-                    .child(self.render_right_panel(cx)),
+                    .when(self.show_right_panel, |el| el.child(self.render_right_panel(cx))),
             )
             .child(
                 div()

@@ -1,5 +1,6 @@
 mod editor;
 mod math_view;
+mod pdf_preview;
 mod theme;
 
 use editor::TexWordEditor;
