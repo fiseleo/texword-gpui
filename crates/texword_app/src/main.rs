@@ -1,9 +1,10 @@
 mod editor;
 mod math_view;
+mod metadata;
 mod pdf_preview;
 mod theme;
 
-use editor::{SaveFile, TexWordEditor};
+use editor::{SaveFile, TexWordEditor, ToggleSearch};
 use gpui::{
     App, AppContext as _, Bounds, KeyBinding, QuitMode, WindowBounds, WindowOptions, px, size,
 };
@@ -75,6 +76,8 @@ fn main() -> anyhow::Result<()> {
             cx.bind_keys([
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 KeyBinding::new("cmd-s", SaveFile, None),
+                KeyBinding::new("ctrl-f", ToggleSearch, None),
+                KeyBinding::new("cmd-f", ToggleSearch, None),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1420.0), px(900.0)), cx);

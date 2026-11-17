@@ -1,13 +1,15 @@
 use crate::{
     math_view::render_math_tex,
+    metadata::BookMetadata,
     pdf_preview::{estimate_chapter_pdf_pages, get_pdf_page_count, render_pdf_page_png},
     theme::BookPalette,
 };
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FocusHandle, FontStyle, FontWeight,
-    HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement, ListAlignment, ListState,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage as _,
-    StyledText, Subscription, Window, actions, div, img, list, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontStyle,
+    FontWeight, HighlightStyle, Image, ImageFormat, InteractiveElement, IntoElement, ListAlignment,
+    ListState, ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage as _, StyledText, Subscription, Window, actions, div, img, list,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Sizable as _,
@@ -27,13 +29,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
-actions!(texword, [SaveFile]);
+actions!(texword, [SaveFile, ToggleSearch]);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
     Preview,
     Terms,
+    Meta,
     Mcp,
+}
+
+#[derive(Clone)]
+struct SearchHit {
+    chapter_rel: String,
+    block_idx: Option<usize>,
+    line: usize,
+    snippet: String,
 }
 
 pub struct TexWordEditor {
@@ -49,6 +60,9 @@ pub struct TexWordEditor {
     edit_textarea: Entity<TextareaState>,
     live_preview_blocks: Vec<Block>,
     expanded_raw: std::collections::HashSet<String>,
+    show_search: bool,
+    search_input: Entity<InputState>,
+    search_hits: Vec<SearchHit>,
     show_right_panel: bool,
     right_tab: RightTab,
     term_issues: Vec<TermIssue>,
@@ -63,6 +77,9 @@ pub struct TexWordEditor {
     pdf_error: Option<String>,
     toc_pages: Vec<(String, usize)>,
     figure_thumbs: HashMap<String, Arc<Image>>,
+    meta_author_input: Entity<InputState>,
+    meta_publisher_input: Entity<InputState>,
+    meta_date_input: Entity<InputState>,
     focus_handle: FocusHandle,
     status_message: String,
     _sync_task: gpui::Task<()>,
@@ -91,6 +108,17 @@ impl TexWordEditor {
                 this.jump_pdf_from_input(window, cx);
             }
         });
+
+        let search_input = cx.new(|cx| InputState::new(window, cx));
+        let search_sub = cx.subscribe_in(&search_input, window, |this, _, ev: &InputEvent, _window, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.run_search(false, cx);
+            }
+        });
+
+        let meta_author_input = cx.new(|cx| InputState::new(window, cx));
+        let meta_publisher_input = cx.new(|cx| InputState::new(window, cx));
+        let meta_date_input = cx.new(|cx| InputState::new(window, cx));
 
         let (chapters, active_chapter, document, dirty, mcp_logs, root_dir, mut rx) = {
             let guard = shared.blocking_read();
@@ -166,6 +194,9 @@ impl TexWordEditor {
             edit_textarea,
             live_preview_blocks: Vec::new(),
             expanded_raw: std::collections::HashSet::new(),
+            show_search: false,
+            search_input,
+            search_hits: Vec::new(),
             show_right_panel: true,
             right_tab: RightTab::Preview,
             term_issues: Vec::new(),
@@ -180,14 +211,18 @@ impl TexWordEditor {
             pdf_error: None,
             toc_pages,
             figure_thumbs: HashMap::new(),
+            meta_author_input,
+            meta_publisher_input,
+            meta_date_input,
             focus_handle: cx.focus_handle(),
             status_message:
-                "就緒：左側選章節、中央滾輪瀏覽與即時編輯（Ctrl+S 存檔）、右側即時檢視 PDF 排版預覽。"
+                "就緒：Ctrl+S 存檔、Ctrl+F 搜尋、右側可預覽 PDF 或設定封面與作者。"
                     .to_string(),
             _sync_task: sync_task,
-            _subscriptions: vec![edit_sub, page_sub],
+            _subscriptions: vec![edit_sub, page_sub, search_sub],
         };
         editor.refresh_term_issues();
+        editor.sync_meta_inputs(window, cx);
         editor.jump_pdf_to_current_chapter();
         editor.sync_pdf_page_input(window, cx);
         editor.refresh_pdf_preview(true, cx);
@@ -361,6 +396,200 @@ impl TexWordEditor {
             self.status_message = format!("無法定位至第 {} 行：{}", issue.line, issue.matched);
             cx.notify();
         }
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search = !self.show_search;
+        if self.show_search {
+            let focus = self.search_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        } else {
+            self.search_hits.clear();
+        }
+        cx.notify();
+    }
+
+    fn run_search(&mut self, full_book: bool, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().trim().to_string();
+        if query.is_empty() {
+            self.search_hits.clear();
+            cx.notify();
+            return;
+        }
+        let q_lower = query.to_lowercase();
+        let mut hits = Vec::new();
+        if full_book {
+            let guard = self.shared.blocking_read();
+            if let Some(project) = &guard.project {
+                for (file, line, snippet) in project.search(&query, 30) {
+                    hits.push(SearchHit {
+                        chapter_rel: file,
+                        block_idx: None,
+                        line,
+                        snippet,
+                    });
+                }
+            }
+        } else {
+            let active = self
+                .active_chapter
+                .clone()
+                .unwrap_or_else(|| "active.tex".to_string());
+            for (idx, b) in self.document.blocks.iter().enumerate() {
+                let raw = serialize_block(b);
+                if raw.to_lowercase().contains(&q_lower) {
+                    let snippet = raw.lines().next().unwrap_or("").chars().take(60).collect();
+                    hits.push(SearchHit {
+                        chapter_rel: active.clone(),
+                        block_idx: Some(idx),
+                        line: idx + 1,
+                        snippet,
+                    });
+                }
+            }
+        }
+        self.status_message = format!("搜尋「{query}」找到 {} 筆結果", hits.len());
+        self.search_hits = hits;
+        cx.notify();
+    }
+
+    fn jump_to_search_hit(&mut self, hit: &SearchHit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_chapter.as_deref() != Some(hit.chapter_rel.as_str()) {
+            self.open_chapter(&hit.chapter_rel, window, cx);
+        }
+        let target_idx = hit.block_idx.or_else(|| {
+            let needle: String = hit.snippet.chars().take(20).collect();
+            self.document
+                .blocks
+                .iter()
+                .position(|b| serialize_block(b).contains(&needle))
+        });
+        if let Some(idx) = target_idx {
+            self.selected_block = Some(idx);
+            self.editing_block = None;
+            self.doc_list_state.splice(idx..idx + 1, 1);
+            self.doc_list_state.scroll_to_reveal_item(idx);
+            self.status_message = format!("已跳轉至 {} 區塊 #{}", hit.chapter_rel, idx + 1);
+        }
+        cx.notify();
+    }
+
+    fn open_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("選擇 LaTeX 書稿專案資料夾".into()),
+        });
+        let entity = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(Ok(Some(paths))) = rx.await
+                    && let Some(dir) = paths.into_iter().next()
+                {
+                    let _ = cx.update(|window, cx| {
+                        let _ = entity.update(cx, |editor, cx| {
+                            editor.load_project_dir(&dir, window, cx);
+                        });
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn load_project_dir(&mut self, dir: &PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let mut guard = self.shared.blocking_write();
+        match guard.open_project(dir) {
+            Ok(()) => {
+                self.chapters = guard
+                    .project
+                    .as_ref()
+                    .map(|p| p.chapters.clone())
+                    .unwrap_or_default();
+                self.active_chapter = guard.active_chapter.clone();
+                self.document = guard.document.clone();
+                self.dirty = false;
+                self.editing_block = None;
+                self.selected_block = None;
+                self.figure_thumbs.clear();
+                let pdf = dir.join("main.pdf");
+                self.pdf_path = if pdf.exists() { Some(pdf) } else { None };
+                self.toc_pages = estimate_chapter_pdf_pages(dir);
+                self.doc_list_state.reset(self.document.blocks.len());
+                self.status_message = format!("已開啟專案：{}", dir.display());
+            }
+            Err(e) => {
+                self.status_message = format!("開啟專案失敗：{e}");
+            }
+        }
+        drop(guard);
+        self.refresh_term_issues();
+        self.sync_meta_inputs(window, cx);
+        self.jump_pdf_to_current_chapter();
+        self.sync_pdf_page_input(window, cx);
+        self.refresh_pdf_preview(true, cx);
+        self.load_figure_thumbnails(cx);
+        cx.notify();
+    }
+
+    fn sync_meta_inputs(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let root_opt = {
+            let guard = self.shared.blocking_read();
+            guard.project.as_ref().map(|p| p.root_dir.clone())
+        };
+        let Some(root) = root_opt else {
+            return;
+        };
+        let meta = BookMetadata::load_from_project(&root);
+        self.meta_author_input.update(cx, |s, cx| {
+            s.set_value(meta.author, window, cx);
+        });
+        self.meta_publisher_input.update(cx, |s, cx| {
+            s.set_value(meta.publisher, window, cx);
+        });
+        self.meta_date_input.update(cx, |s, cx| {
+            s.set_value(meta.date_ym, window, cx);
+        });
+    }
+
+    fn apply_metadata_to_project(&mut self, cx: &mut Context<Self>) {
+        let root_opt = {
+            let guard = self.shared.blocking_read();
+            guard.project.as_ref().map(|p| p.root_dir.clone())
+        };
+        let Some(root) = root_opt else {
+            return;
+        };
+        let meta = BookMetadata {
+            author: self.meta_author_input.read(cx).value().to_string(),
+            publisher: self.meta_publisher_input.read(cx).value().to_string(),
+            date_ym: self.meta_date_input.read(cx).value().to_string(),
+        };
+        match meta.save_to_project(&root) {
+            Ok(files) => {
+                {
+                    let mut guard = self.shared.blocking_write();
+                    let _ = guard.reload_from_disk();
+                    self.document = guard.document.clone();
+                    self.dirty = false;
+                    guard.push_log(format!("[Meta] 已更新 {}", files.join("、")));
+                }
+                self.doc_list_state.reset(self.document.blocks.len());
+                self.refresh_term_issues();
+                self.status_message = format!(
+                    "已寫入 {}（可按「XeLaTeX 快速編譯」更新 PDF）",
+                    if files.is_empty() {
+                        "無變更".to_string()
+                    } else {
+                        files.join("、")
+                    }
+                );
+            }
+            Err(e) => {
+                self.status_message = format!("更新封面／書目失敗：{e}");
+            }
+        }
+        cx.notify();
     }
 
     fn jump_pdf_to_current_chapter(&mut self) {
@@ -666,10 +895,26 @@ impl TexWordEditor {
                     .flex_wrap()
                     .gap(px(6.0))
                     .child(
+                        Button::new("btn-open-proj")
+                            .secondary()
+                            .label("開啟專案")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_project_dialog(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("btn-save")
                             .primary()
                             .label(if self.dirty { "儲存 .tex *" } else { "儲存 .tex" })
                             .on_click(cx.listener(|this, _, _, cx| this.save_active_file(cx))),
+                    )
+                    .child(
+                        Button::new("btn-search")
+                            .secondary()
+                            .label("搜尋 (Ctrl+F)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_search(window, cx);
+                            })),
                     )
                     .child(
                         Button::new("btn-add-para")
@@ -877,7 +1122,7 @@ impl TexWordEditor {
     fn render_right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let panel_w = match self.right_tab {
             RightTab::Preview => px(500.0),
-            RightTab::Terms | RightTab::Mcp => px(320.0),
+            RightTab::Terms | RightTab::Meta | RightTab::Mcp => px(340.0),
         };
         div()
             .w(panel_w)
@@ -910,15 +1155,24 @@ impl TexWordEditor {
                     )
                     .child(
                         Button::new("tab-terms")
-                            .label(format!("術語檢查 ({})", self.term_issues.len()))
+                            .label(format!("術語/TODO ({})", self.term_issues.len()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right_tab = RightTab::Terms;
                                 cx.notify();
                             })),
                     )
                     .child(
+                        Button::new("tab-meta")
+                            .label("封面/作者")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.right_tab = RightTab::Meta;
+                                this.sync_meta_inputs(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("tab-mcp")
-                            .label(format!("MCP 同步 ({})", self.mcp_logs.len()))
+                            .label(format!("MCP ({})", self.mcp_logs.len()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right_tab = RightTab::Mcp;
                                 cx.notify();
@@ -1133,6 +1387,60 @@ impl TexWordEditor {
                                 }))
                             }
                         }
+                        RightTab::Meta => el
+                            .child(
+                                div()
+                                    .p(px(10.0))
+                                    .rounded(px(6.0))
+                                    .bg(BookPalette::paper_bg())
+                                    .border_1()
+                                    .border_color(BookPalette::border())
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .text_color(BookPalette::accent())
+                                            .child("封面、書名頁與序言署名設定"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(BookPalette::text_muted())
+                                            .child("作者署名（同步至封面、書名頁、PDF 屬性與序言）"),
+                                    )
+                                    .child(Input::new(&self.meta_author_input).small())
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(BookPalette::text_muted())
+                                            .child("出版社名稱（顯示於封面底欄）"),
+                                    )
+                                    .child(Input::new(&self.meta_publisher_input).small())
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(BookPalette::text_muted())
+                                            .child("序言年月（取代 \\todo{年月}）"),
+                                    )
+                                    .child(Input::new(&self.meta_date_input).small())
+                                    .child(
+                                        div()
+                                            .pt(px(4.0))
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(8.0))
+                                            .child(
+                                                Button::new("btn-apply-meta")
+                                                    .primary()
+                                                    .label("套用並寫回書稿")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.apply_metadata_to_project(cx);
+                                                    })),
+                                            ),
+                                    ),
+                            ),
                         RightTab::Mcp => el
                             .child(
                                 div()
@@ -1337,6 +1645,88 @@ impl TexWordEditor {
             .child(render_block_visual(&block.kind, is_expanded, &self.figure_thumbs))
             .into_any_element()
     }
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w_full()
+            .bg(BookPalette::ribbon_bg())
+            .border_b_1()
+            .border_color(BookPalette::border())
+            .px(px(12.0))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(BookPalette::accent())
+                            .child("搜尋："),
+                    )
+                    .child(Input::new(&self.search_input).small().w(px(260.0)))
+                    .child(
+                        Button::new("btn-search-cur")
+                            .primary()
+                            .label("搜本章")
+                            .on_click(cx.listener(|this, _, _, cx| this.run_search(false, cx))),
+                    )
+                    .child(
+                        Button::new("btn-search-all")
+                            .secondary()
+                            .label("搜全書")
+                            .on_click(cx.listener(|this, _, _, cx| this.run_search(true, cx))),
+                    )
+                    .child(
+                        Button::new("btn-search-close")
+                            .secondary()
+                            .label("關閉")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_search = false;
+                                this.search_hits.clear();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(!self.search_hits.is_empty(), |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .max_h(px(130.0))
+                        .id("search-results-box")
+                        .overflow_y_scrollbar()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .children(self.search_hits.iter().enumerate().map(|(i, hit)| {
+                            let hit_clone = hit.clone();
+                            div()
+                                .id(SharedString::from(format!("shit-{i}")))
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(px(4.0))
+                                .bg(BookPalette::paper_bg())
+                                .border_1()
+                                .border_color(BookPalette::border())
+                                .cursor_pointer()
+                                .hover(|h| h.bg(BookPalette::accent_soft()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.jump_to_search_hit(&hit_clone, window, cx);
+                                }))
+                                .text_size(px(12.0))
+                                .text_color(BookPalette::text_main())
+                                .child(format!(
+                                    "[{} #{}] {}",
+                                    hit.chapter_rel, hit.line, hit.snippet
+                                ))
+                        })),
+                )
+            })
+    }
 }
 
 impl Render for TexWordEditor {
@@ -1346,11 +1736,15 @@ impl Render for TexWordEditor {
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| {
                 this.save_active_file(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
+                this.toggle_search(window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
             .bg(BookPalette::desk_bg())
             .child(self.render_ribbon(cx))
+            .when(self.show_search, |el| el.child(self.render_search_bar(cx)))
             .child(
                 div()
                     .flex_1()

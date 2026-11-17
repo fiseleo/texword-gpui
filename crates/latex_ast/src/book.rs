@@ -105,6 +105,44 @@ impl BookProject {
             }
         }
 
+        if chapters.is_empty() {
+            if path.is_file() {
+                let rel = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("main.tex")
+                    .to_string();
+                let title = read_chapter_title(path).unwrap_or_else(|| rel.clone());
+                chapters.push(ChapterEntry {
+                    relative_path: rel,
+                    full_path: path.to_path_buf(),
+                    section_group: "文件".to_string(),
+                    title,
+                });
+            } else if let Ok(entries) = fs::read_dir(&root_dir) {
+                let mut tex_files: Vec<_> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "tex"))
+                    .collect();
+                tex_files.sort();
+                for p in tex_files {
+                    let rel = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("doc.tex")
+                        .to_string();
+                    let title = read_chapter_title(&p).unwrap_or_else(|| rel.clone());
+                    chapters.push(ChapterEntry {
+                        relative_path: rel,
+                        full_path: p,
+                        section_group: "文件".to_string(),
+                        title,
+                    });
+                }
+            }
+        }
+
         let terms = load_terms_csv(&root_dir.join("terms").join("terms.csv")).unwrap_or_default();
 
         Ok(Self {
