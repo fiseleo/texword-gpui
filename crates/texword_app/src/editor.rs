@@ -328,33 +328,35 @@ impl TexWordEditor {
 
         let shared = self.shared.clone();
         cx.spawn(async move |this, cx| {
-            let res = tokio::task::spawn_blocking(move || {
-                if cfg!(target_os = "windows") && root.join("build.cmd").exists() {
-                    std::process::Command::new("cmd")
-                        .current_dir(&root)
-                        .args(["/C", "build.cmd", "-Quick"])
-                        .output()
-                } else {
-                    std::process::Command::new("xelatex")
-                        .current_dir(&root)
-                        .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
-                        .output()
-                }
-            })
-            .await;
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    if cfg!(target_os = "windows") && root.join("build.cmd").exists() {
+                        std::process::Command::new("cmd")
+                            .current_dir(&root)
+                            .args(["/C", "build.cmd", "-Quick"])
+                            .output()
+                    } else {
+                        std::process::Command::new("xelatex")
+                            .current_dir(&root)
+                            .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
+                            .output()
+                    }
+                })
+                .await;
 
             let summary = match res {
-                Ok(Ok(out)) if out.status.success() => "XeLaTeX 快速編譯成功！".to_string(),
-                Ok(Ok(out)) => format!(
-                    "編譯失敗（exit={}）：{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
+                Ok(out) if out.status.success() => "XeLaTeX 快速編譯成功！".to_string(),
+                Ok(out) => {
+                    let err_msg = String::from_utf8_lossy(&out.stderr)
                         .lines()
-                        .next()
+                        .chain(String::from_utf8_lossy(&out.stdout).lines())
+                        .find(|l| !l.trim().is_empty())
                         .unwrap_or("請檢視 main.log")
-                ),
-                Ok(Err(e)) => format!("找不到編譯器（xelatex / build.cmd）：{e}"),
-                Err(e) => format!("編譯執行緒錯誤：{e}"),
+                        .to_string();
+                    format!("編譯失敗（exit={}）：{err_msg}", out.status)
+                }
+                Err(e) => format!("找不到編譯器（xelatex / build.cmd）：{e}"),
             };
 
             {
