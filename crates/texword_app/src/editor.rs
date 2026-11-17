@@ -10,8 +10,9 @@ use gpui::{
     Window, div, img, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
+    Sizable as _,
     button::{Button, ButtonVariants as _},
-    input::{InputEvent, Textarea, TextareaState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     scroll::{ScrollableElement as _, Scrollbar},
 };
 use latex_ast::{
@@ -53,6 +54,7 @@ pub struct TexWordEditor {
     pdf_page: usize,
     pdf_total_pages: usize,
     pdf_dpi: u32,
+    pdf_page_input: Entity<InputState>,
     pdf_image: Option<Arc<Image>>,
     pdf_loading: bool,
     pdf_error: Option<String>,
@@ -75,6 +77,13 @@ impl TexWordEditor {
                 let text = state.read(cx).value().to_string();
                 this.live_preview_blocks = parse_latex(&text).blocks;
                 cx.notify();
+            }
+        });
+
+        let pdf_page_input = cx.new(|cx| InputState::new(window, cx));
+        let page_sub = cx.subscribe_in(&pdf_page_input, window, |this, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.jump_pdf_from_input(window, cx);
             }
         });
 
@@ -160,6 +169,7 @@ impl TexWordEditor {
             pdf_page: 1,
             pdf_total_pages: 1,
             pdf_dpi: 130,
+            pdf_page_input,
             pdf_image: None,
             pdf_loading: false,
             pdf_error: None,
@@ -168,10 +178,11 @@ impl TexWordEditor {
                 "就緒：左側選章節、中央滾輪瀏覽與即時編輯、右側即時檢視 PDF 排版預覽。"
                     .to_string(),
             _sync_task: sync_task,
-            _subscriptions: vec![edit_sub],
+            _subscriptions: vec![edit_sub, page_sub],
         };
         editor.refresh_term_issues();
         editor.jump_pdf_to_current_chapter();
+        editor.sync_pdf_page_input(window, cx);
         editor.refresh_pdf_preview(true, cx);
         editor
     }
@@ -215,7 +226,7 @@ impl TexWordEditor {
         }
     }
 
-    fn open_chapter(&mut self, rel_path: &str, cx: &mut Context<Self>) {
+    fn open_chapter(&mut self, rel_path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let mut guard = self.shared.blocking_write();
         match guard.open_chapter_path(rel_path) {
             Ok(opened) => {
@@ -234,6 +245,7 @@ impl TexWordEditor {
         drop(guard);
         self.refresh_term_issues();
         self.jump_pdf_to_current_chapter();
+        self.sync_pdf_page_input(window, cx);
         self.refresh_pdf_preview(false, cx);
         cx.notify();
     }
@@ -256,9 +268,35 @@ impl TexWordEditor {
         }
     }
 
-    fn set_pdf_page(&mut self, page: usize, cx: &mut Context<Self>) {
+    fn sync_pdf_page_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.pdf_page.to_string();
+        self.pdf_page_input.update(cx, |s, cx| {
+            s.set_value(p, window, cx);
+        });
+    }
+
+    fn jump_pdf_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.pdf_page_input.read(cx).value().to_string();
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            self.set_pdf_page(n, Some(window), cx);
+        } else {
+            self.sync_pdf_page_input(window, cx);
+            self.status_message = format!("請輸入有效頁碼（1～{}）", self.pdf_total_pages.max(1));
+            cx.notify();
+        }
+    }
+
+    fn set_pdf_page(
+        &mut self,
+        page: usize,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let total = self.pdf_total_pages.max(1);
         self.pdf_page = page.clamp(1, total);
+        if let Some(w) = window {
+            self.sync_pdf_page_input(w, cx);
+        }
         self.refresh_pdf_preview(false, cx);
     }
 
@@ -704,8 +742,8 @@ impl TexWordEditor {
                                     .border_color(BookPalette::accent())
                             })
                             .when(!is_active, |el| el.hover(|h| h.bg(BookPalette::border())))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_chapter(&rel, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_chapter(&rel, window, cx);
                             }))
                             .child(
                                 div()
@@ -793,39 +831,60 @@ impl TexWordEditor {
                             Button::new("pdf-prev10")
                                 .secondary()
                                 .label("-10")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_pdf_page(page.saturating_sub(10).max(1), cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_pdf_page(page.saturating_sub(10).max(1), Some(window), cx);
                                 })),
                         )
                         .child(
                             Button::new("pdf-prev")
                                 .secondary()
                                 .label("上頁")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_pdf_page(page.saturating_sub(1).max(1), cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_pdf_page(page.saturating_sub(1).max(1), Some(window), cx);
                                 })),
                         )
                         .child(
                             div()
-                                .px(px(6.0))
-                                .text_size(px(12.0))
-                                .text_color(BookPalette::text_main())
-                                .child(format!("第 {page} / {total} 頁")),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(BookPalette::text_main())
+                                        .child("第"),
+                                )
+                                .child(Input::new(&self.pdf_page_input).small().w(px(56.0)))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(BookPalette::text_main())
+                                        .child(format!("/ {total} 頁")),
+                                )
+                                .child(
+                                    Button::new("pdf-go")
+                                        .secondary()
+                                        .label("跳轉")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.jump_pdf_from_input(window, cx);
+                                        })),
+                                ),
                         )
                         .child(
                             Button::new("pdf-next")
                                 .secondary()
                                 .label("下頁")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_pdf_page((page + 1).min(total), cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_pdf_page((page + 1).min(total), Some(window), cx);
                                 })),
                         )
                         .child(
                             Button::new("pdf-next10")
                                 .secondary()
                                 .label("+10")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_pdf_page((page + 10).min(total), cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_pdf_page((page + 10).min(total), Some(window), cx);
                                 })),
                         )
                         .child(
