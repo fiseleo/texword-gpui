@@ -32,3 +32,9 @@ rmcp = { version = "3.10.0", features = ["server", "macros", "transport-io", "tr
 schemars = "1.0"
 axum = "0.8"
 tokio-util = "0.7"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

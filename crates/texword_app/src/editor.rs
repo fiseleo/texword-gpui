@@ -1,19 +1,22 @@
 use crate::{math_view::render_math_tex, theme::BookPalette};
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, AppContext as _, Context, Entity, FontStyle, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div, list,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Textarea, TextareaState},
+    scroll::{ScrollableElement as _, Scrollbar},
 };
 use latex_ast::{
     Block, BlockKind, CalloutKind, ChapterEntry, Document, HeadingLevel, Inline, TermIssue,
     parse_latex, serialize_block, serialize_latex,
 };
-use math_preview::format_chem_unicode;
+use math_preview::{format_chem_unicode, math_to_plain_text, parse_math};
 use mcp_server::{EditorSharedState, EditorSyncEvent};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
@@ -31,6 +34,7 @@ pub struct TexWordEditor {
     active_chapter: Option<String>,
     document: Document,
     dirty: bool,
+    doc_list_state: ListState,
     selected_block: Option<usize>,
     editing_block: Option<usize>,
     edit_textarea: Entity<TextareaState>,
@@ -68,11 +72,15 @@ impl TexWordEditor {
             )
         };
 
+        let doc_list_state =
+            ListState::new(document.blocks.len(), ListAlignment::Top, px(480.0));
+
         let shared_for_task = shared.clone();
         let sync_task = cx.spawn(async move |this, cx| {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
+                        let reset_scroll = matches!(ev, EditorSyncEvent::ChapterOpened { .. });
                         let summary = match &ev {
                             EditorSyncEvent::ChapterOpened { path } => {
                                 format!("已切換章節：{path}")
@@ -81,14 +89,14 @@ impl TexWordEditor {
                             EditorSyncEvent::LogMessage { message, .. } => message.clone(),
                         };
                         let _ = this.update(cx, |editor, cx| {
-                            editor.pull_from_shared(&shared_for_task);
+                            editor.pull_from_shared(&shared_for_task, reset_scroll);
                             editor.status_message = summary;
                             cx.notify();
                         });
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let _ = this.update(cx, |editor, cx| {
-                            editor.pull_from_shared(&shared_for_task);
+                            editor.pull_from_shared(&shared_for_task, false);
                             cx.notify();
                         });
                     }
@@ -104,6 +112,7 @@ impl TexWordEditor {
             active_chapter,
             document,
             dirty,
+            doc_list_state,
             selected_block: None,
             editing_block: None,
             edit_textarea,
@@ -111,14 +120,17 @@ impl TexWordEditor {
             right_tab: RightTab::Terms,
             term_issues: Vec::new(),
             mcp_logs,
-            status_message: "就緒：點擊任一段落或公式即可像 Word 一樣編輯，右側可檢視術語與 MCP 即時同步。".to_string(),
+            status_message:
+                "就緒：滾輪上下滑動閱讀整章，點擊任一段落或公式即可像 Word 一樣編輯。"
+                    .to_string(),
             _sync_task: sync_task,
         };
         editor.refresh_term_issues();
         editor
     }
 
-    fn pull_from_shared(&mut self, shared: &Arc<RwLock<EditorSharedState>>) {
+    fn pull_from_shared(&mut self, shared: &Arc<RwLock<EditorSharedState>>, reset_list: bool) {
+        let old_len = self.document.blocks.len();
         let guard = shared.blocking_read();
         if let Some(p) = &guard.project {
             self.chapters = p.chapters.clone();
@@ -127,6 +139,14 @@ impl TexWordEditor {
         self.document = guard.document.clone();
         self.dirty = guard.dirty;
         self.mcp_logs = guard.mcp_logs.clone();
+        let new_len = self.document.blocks.len();
+        drop(guard);
+
+        if reset_list || old_len != new_len {
+            self.doc_list_state.reset(new_len);
+        } else if new_len > 0 {
+            self.doc_list_state.splice(0..new_len, new_len);
+        }
         self.refresh_term_issues();
     }
 
@@ -157,6 +177,7 @@ impl TexWordEditor {
                 self.dirty = false;
                 self.editing_block = None;
                 self.selected_block = None;
+                self.doc_list_state.reset(self.document.blocks.len());
                 self.status_message = format!("已開啟：{opened}");
             }
             Err(e) => {
@@ -199,6 +220,8 @@ impl TexWordEditor {
             self.edit_textarea.update(cx, |state, cx| {
                 state.set_value(raw, window, cx);
             });
+            self.doc_list_state.splice(idx..idx + 1, 1);
+            self.doc_list_state.scroll_to_reveal_item(idx);
             cx.notify();
         }
     }
@@ -215,14 +238,17 @@ impl TexWordEditor {
             return;
         }
         if idx < self.document.blocks.len() {
+            let new_count = parsed.blocks.len();
             self.document
                 .blocks
                 .splice(idx..=idx, parsed.blocks.drain(..));
             self.dirty = true;
             self.editing_block = None;
+            self.doc_list_state.splice(idx..idx + 1, new_count);
             self.push_document_to_shared();
             self.refresh_term_issues();
-            self.status_message = format!("已更新區塊 #{}（尚未存檔前可再修改，或按儲存寫回 .tex）", idx + 1);
+            self.status_message =
+                format!("已更新區塊 #{}（可按「儲存 .tex」寫回檔案）", idx + 1);
         }
         cx.notify();
     }
@@ -236,6 +262,7 @@ impl TexWordEditor {
             self.dirty = true;
             self.editing_block = None;
             self.selected_block = None;
+            self.doc_list_state.splice(idx..idx + 1, 0);
             self.push_document_to_shared();
             self.refresh_term_issues();
             self.status_message = format!("已刪除區塊 #{}", idx + 1);
@@ -257,10 +284,12 @@ impl TexWordEditor {
             Some(idx) if idx + 1 <= self.document.blocks.len() => idx + 1,
             _ => self.document.blocks.len(),
         };
+        let count = parsed.blocks.len();
         for (offset, b) in parsed.blocks.into_iter().enumerate() {
             self.document.blocks.insert(insert_pos + offset, b);
         }
         self.dirty = true;
+        self.doc_list_state.splice(insert_pos..insert_pos, count);
         self.push_document_to_shared();
         self.start_editing_block(insert_pos, window, cx);
     }
@@ -333,7 +362,7 @@ impl TexWordEditor {
                 guard.push_log(format!("[Build] {summary}"));
             }
             let _ = this.update(cx, |editor, cx| {
-                editor.pull_from_shared(&shared);
+                editor.pull_from_shared(&shared, false);
                 editor.status_message = summary;
                 cx.notify();
             });
@@ -440,7 +469,11 @@ impl TexWordEditor {
                             .secondary()
                             .label("\\term")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.append_inline_snippet("\\term{比衝}{specific impulse}", window, cx);
+                                this.append_inline_snippet(
+                                    "\\term{比衝}{specific impulse}",
+                                    window,
+                                    cx,
+                                );
                             })),
                     )
                     .child(
@@ -484,6 +517,7 @@ impl TexWordEditor {
         div()
             .w(px(240.0))
             .h_full()
+            .min_h_0()
             .bg(BookPalette::sidebar_bg())
             .border_r_1()
             .border_color(BookPalette::border())
@@ -503,13 +537,15 @@ impl TexWordEditor {
                 div()
                     .id("chapter-list")
                     .flex_1()
-                    .overflow_y_scroll()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
                     .p(px(8.0))
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
                     .children(self.chapters.iter().enumerate().map(|(i, ch)| {
-                        let is_active = self.active_chapter.as_deref() == Some(ch.relative_path.as_str());
+                        let is_active =
+                            self.active_chapter.as_deref() == Some(ch.relative_path.as_str());
                         let rel = ch.relative_path.clone();
                         div()
                             .id(SharedString::from(format!("ch-{i}")))
@@ -546,6 +582,7 @@ impl TexWordEditor {
         div()
             .w(px(300.0))
             .h_full()
+            .min_h_0()
             .bg(BookPalette::sidebar_bg())
             .border_l_1()
             .border_color(BookPalette::border())
@@ -580,7 +617,8 @@ impl TexWordEditor {
                 div()
                     .id("right-panel-body")
                     .flex_1()
-                    .overflow_y_scroll()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
                     .p(px(10.0))
                     .flex()
                     .flex_col()
@@ -662,33 +700,55 @@ impl TexWordEditor {
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("word-paper-scroll")
+            .relative()
             .flex_1()
             .h_full()
-            .overflow_y_scroll()
+            .min_w_0()
+            .min_h_0()
             .bg(BookPalette::desk_bg())
-            .py(px(24.0))
-            .px(px(20.0))
+            .child(
+                list(
+                    self.doc_list_state.clone(),
+                    cx.processor(|this, idx, _window, cx| {
+                        this.render_list_row(idx, cx)
+                    }),
+                )
+                .size_full()
+                .pr(px(14.0)),
+            )
+            .child(Scrollbar::vertical(&self.doc_list_state))
+    }
+
+    fn render_list_row(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(block) = self.document.blocks.get(idx) else {
+            return div().into_any_element();
+        };
+        let total = self.document.blocks.len();
+        let is_first = idx == 0;
+        let is_last = idx + 1 == total;
+
+        div()
+            .w_full()
             .flex()
             .flex_col()
             .items_center()
+            .when(is_first, |el| el.pt(px(20.0)))
+            .when(is_last, |el| el.pb(px(32.0)))
             .child(
                 div()
                     .w(px(820.0))
-                    .min_h(px(900.0))
+                    .max_w_full()
                     .bg(BookPalette::paper_bg())
-                    .border_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .when(is_first, |el| el.border_t_1().pt(px(36.0)).rounded_t(px(4.0)))
+                    .when(is_last, |el| el.border_b_1().pb(px(48.0)).rounded_b(px(4.0)))
                     .border_color(BookPalette::border())
-                    .rounded(px(4.0))
-                    .px(px(56.0))
-                    .py(px(48.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    .children(self.document.blocks.iter().enumerate().map(|(idx, block)| {
-                        self.render_block_slot(idx, block, cx)
-                    })),
+                    .px(px(52.0))
+                    .py(px(6.0))
+                    .child(self.render_block_slot(idx, block, cx)),
             )
+            .into_any_element()
     }
 
     fn render_block_slot(
@@ -712,7 +772,10 @@ impl TexWordEditor {
                     div()
                         .text_size(px(11.5))
                         .text_color(BookPalette::accent())
-                        .child(format!("正在編輯區塊 #{}（支援中文輸入法與即時 LaTeX 語法）", idx + 1)),
+                        .child(format!(
+                            "正在編輯區塊 #{}（支援中文輸入法與即時 LaTeX 語法）",
+                            idx + 1
+                        )),
                 )
                 .child(Textarea::new(&self.edit_textarea).h(px(140.0)))
                 .child(
@@ -724,14 +787,17 @@ impl TexWordEditor {
                             Button::new("btn-apply-edit")
                                 .primary()
                                 .label("套用並即時渲染")
-                                .on_click(cx.listener(|this, _, _, cx| this.apply_editing_block(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.apply_editing_block(cx)),
+                                ),
                         )
                         .child(
                             Button::new("btn-cancel-edit")
                                 .secondary()
                                 .label("取消")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.editing_block = None;
+                                    this.doc_list_state.splice(idx..idx + 1, 1);
                                     cx.notify();
                                 })),
                         )
@@ -739,7 +805,9 @@ impl TexWordEditor {
                             Button::new("btn-del-edit")
                                 .danger()
                                 .label("刪除區塊")
-                                .on_click(cx.listener(|this, _, _, cx| this.delete_selected_block(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.delete_selected_block(cx)),
+                                ),
                         ),
                 )
                 .into_any_element();
@@ -751,6 +819,7 @@ impl TexWordEditor {
 
         div()
             .id(SharedString::from(format!("blk-{idx}")))
+            .w_full()
             .rounded(px(6.0))
             .px(px(8.0))
             .py(px(4.0))
@@ -760,9 +829,11 @@ impl TexWordEditor {
                     .border_1()
                     .border_color(BookPalette::accent())
             })
-            .when(!is_selected, |el| el.hover(|h| h.bg(BookPalette::math_bg())))
             .on_click(cx.listener(move |this, _, window, cx| {
-                if matches!(this.document.blocks.get(idx).map(|b| &b.kind), Some(BlockKind::RawLatex { .. } | BlockKind::Figure { .. })) {
+                if matches!(
+                    this.document.blocks.get(idx).map(|b| &b.kind),
+                    Some(BlockKind::RawLatex { .. } | BlockKind::Figure { .. })
+                ) {
                     if this.selected_block == Some(idx) {
                         this.start_editing_block(idx, window, cx);
                     } else {
@@ -770,6 +841,7 @@ impl TexWordEditor {
                         if !this.expanded_raw.insert(block_id.clone()) {
                             this.expanded_raw.remove(&block_id);
                         }
+                        this.doc_list_state.splice(idx..idx + 1, 1);
                         cx.notify();
                     }
                 } else {
@@ -847,8 +919,10 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                 .flex_row()
                 .items_baseline()
                 .justify_between()
+                .gap(px(8.0))
                 .child(
                     div()
+                        .flex_1()
                         .text_size(px(font_px))
                         .text_color(color)
                         .child(title.clone()),
@@ -863,7 +937,7 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                 })
                 .into_any_element()
         }
-        BlockKind::Paragraph { inlines } => render_inlines_flow(inlines),
+        BlockKind::Paragraph { inlines } => render_inlines_styled_text(inlines),
         BlockKind::MathBlock { env, tex, label } => div()
             .w_full()
             .my(px(4.0))
@@ -877,7 +951,13 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
             .flex_row()
             .items_center()
             .justify_between()
-            .child(div().flex_1().flex().justify_center().child(render_math_tex(tex, 18.0)))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_center()
+                    .child(render_math_tex(tex, 18.0)),
+            )
             .child(
                 div()
                     .text_size(px(12.0))
@@ -949,9 +1029,13 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                             .text_size(px(13.0))
                             .text_color(BookPalette::accent())
                             .child(if *has_tikzpicture {
-                                "圖表區塊（內嵌 TikZ 向量圖 — 點擊展開 / 再點編輯）".to_string()
+                                "圖表區塊（內嵌 TikZ 向量圖 — 點擊展開 / 再點編輯）"
+                                    .to_string()
                             } else {
-                                format!("圖表區塊：{}", path.as_deref().unwrap_or("未指定圖檔"))
+                                format!(
+                                    "圖表區塊：{}",
+                                    path.as_deref().unwrap_or("未指定圖檔")
+                                )
                             }),
                     )
                     .when_some(label.clone(), |el, l| {
@@ -988,10 +1072,10 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
             .into_any_element(),
         BlockKind::List { ordered, items } => div()
             .w_full()
-            .pl(px(16.0))
+            .pl(px(12.0))
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(6.0))
             .children(items.iter().enumerate().map(|(i, item)| {
                 let bullet = if *ordered {
                     format!("{}.", i + 1)
@@ -999,16 +1083,24 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
                     "•".to_string()
                 };
                 div()
+                    .w_full()
                     .flex()
                     .flex_row()
+                    .items_start()
                     .gap(px(8.0))
                     .child(
                         div()
-                            .text_size(px(14.5))
+                            .text_size(px(15.0))
+                            .line_height(px(24.0))
                             .text_color(BookPalette::accent())
                             .child(bullet),
                     )
-                    .child(div().flex_1().child(render_inlines_flow(item)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(render_inlines_styled_text(item)),
+                    )
             }))
             .into_any_element(),
         BlockKind::Comment { lines } => div()
@@ -1050,120 +1142,195 @@ fn render_block_visual(kind: &BlockKind, expanded_raw: bool) -> AnyElement {
     }
 }
 
-fn render_inlines_flow(inlines: &[Inline]) -> AnyElement {
+/// Flatten paragraph/list inlines into a single wrapping `StyledText` with rich highlights.
+/// Using one `StyledText` per paragraph enables crisp CJK line wrapping and 10x faster layout.
+fn render_inlines_styled_text(inlines: &[Inline]) -> AnyElement {
+    let mut text = String::new();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    collect_inline_runs(inlines, &mut text, &mut highlights, HighlightStyle::default());
+
+    if text.is_empty() {
+        text.push(' ');
+    }
+
     div()
         .w_full()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .items_baseline()
-        .gap(px(2.0))
-        .children(inlines.iter().map(render_inline_item))
+        .text_size(px(15.0))
+        .line_height(px(25.0))
+        .text_color(BookPalette::text_main())
+        .child(StyledText::new(text).with_highlights(highlights))
         .into_any_element()
 }
 
-fn render_inline_item(inline: &Inline) -> AnyElement {
-    match inline {
-        Inline::Text { text } => div()
-            .text_size(px(15.0))
-            .line_height(px(24.0))
-            .text_color(BookPalette::text_main())
-            .child(text.clone())
-            .into_any_element(),
-        Inline::Math { tex } => div()
-            .px(px(4.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::math_bg())
-            .child(render_math_tex(tex, 14.5))
-            .into_any_element(),
-        Inline::Term { zh, en } => div()
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::accent_soft())
-            .text_size(px(14.5))
-            .text_color(BookPalette::accent())
-            .child(format!("{zh}（{en}）"))
-            .into_any_element(),
-        Inline::SiUnit { value, unit } => div()
-            .px(px(5.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::sidebar_bg())
-            .border_1()
-            .border_color(BookPalette::border())
-            .text_size(px(14.0))
-            .text_color(BookPalette::text_main())
-            .child(format!("{value} {unit}"))
-            .into_any_element(),
-        Inline::Chem { formula } => div()
-            .px(px(5.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::case_soft())
-            .text_size(px(14.0))
-            .text_color(BookPalette::case_green())
-            .child(format_chem_unicode(formula))
-            .into_any_element(),
-        Inline::Bold { children } => div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .children(children.iter().map(render_inline_item))
-            .into_any_element(),
-        Inline::Italic { children } => div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .text_color(BookPalette::text_muted())
-            .children(children.iter().map(render_inline_item))
-            .into_any_element(),
-        Inline::Ref { ref_cmd, target } => div()
-            .px(px(5.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::accent_soft())
-            .text_size(px(13.0))
-            .text_color(BookPalette::accent())
-            .child(format!("[{ref_cmd}:{target}]"))
-            .into_any_element(),
-        Inline::Cite { keys } => div()
-            .px(px(5.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::sidebar_bg())
-            .text_size(px(12.5))
-            .text_color(BookPalette::text_muted())
-            .child(format!("[{keys}]"))
-            .into_any_element(),
-        Inline::Todo { text } => div()
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::warn_soft())
-            .text_size(px(13.0))
-            .text_color(BookPalette::todo_red())
-            .child(format!("TODO: {text}"))
-            .into_any_element(),
-        Inline::NeedCite => div()
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded(px(4.0))
-            .bg(BookPalette::warn_soft())
-            .text_size(px(13.0))
-            .text_color(BookPalette::todo_red())
-            .child("[待補引用]")
-            .into_any_element(),
-        Inline::Russian { text } => div()
-            .text_size(px(14.5))
-            .text_color(BookPalette::text_muted())
-            .child(text.clone())
-            .into_any_element(),
-        Inline::Macro { raw } => div()
-            .text_size(px(13.0))
-            .text_color(BookPalette::text_muted())
-            .child(raw.clone())
-            .into_any_element(),
+fn collect_inline_runs(
+    inlines: &[Inline],
+    out: &mut String,
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+    inherited: HighlightStyle,
+) {
+    for inline in inlines {
+        match inline {
+            Inline::Text { text } => {
+                let start = out.len();
+                let cleaned = text.replace('~', " ");
+                out.push_str(&cleaned);
+                if has_style(&inherited) && out.len() > start {
+                    highlights.push((start..out.len(), inherited));
+                }
+            }
+            Inline::Math { tex } => {
+                let rendered = math_to_plain_text(&parse_math(tex));
+                let start = out.len();
+                out.push_str(&rendered);
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::accent()),
+                        background_color: Some(BookPalette::math_bg()),
+                        font_style: Some(FontStyle::Italic),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Term { zh, en } => {
+                let start = out.len();
+                out.push_str(&format!("{zh}（{en}）"));
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::accent()),
+                        background_color: Some(BookPalette::accent_soft()),
+                        font_weight: Some(FontWeight::SEMIBOLD),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::SiUnit { value, unit } => {
+                let start = out.len();
+                out.push_str(&format!("{value} {unit}"));
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::text_main()),
+                        background_color: Some(BookPalette::sidebar_bg()),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Chem { formula } => {
+                let start = out.len();
+                out.push_str(&format_chem_unicode(formula));
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::case_green()),
+                        background_color: Some(BookPalette::case_soft()),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Bold { children } => {
+                let next = HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..inherited
+                };
+                collect_inline_runs(children, out, highlights, next);
+            }
+            Inline::Italic { children } => {
+                let next = HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    color: Some(BookPalette::text_muted()),
+                    ..inherited
+                };
+                collect_inline_runs(children, out, highlights, next);
+            }
+            Inline::Ref { ref_cmd, target } => {
+                let start = out.len();
+                let label = match ref_cmd.as_str() {
+                    "figref" => format!("圖[{target}]"),
+                    "tabref" => format!("表[{target}]"),
+                    "eqnref" => format!("式[{target}]"),
+                    "chapref" => format!("章[{target}]"),
+                    "secref" => format!("節[{target}]"),
+                    _ => format!("[{target}]"),
+                };
+                out.push_str(&label);
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::accent()),
+                        background_color: Some(BookPalette::accent_soft()),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Cite { keys } => {
+                let start = out.len();
+                out.push_str(&format!("[{keys}]"));
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::text_muted()),
+                        background_color: Some(BookPalette::sidebar_bg()),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Todo { text } => {
+                let start = out.len();
+                out.push_str(&format!("[TODO: {text}]"));
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::todo_red()),
+                        background_color: Some(BookPalette::warn_soft()),
+                        font_weight: Some(FontWeight::BOLD),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::NeedCite => {
+                let start = out.len();
+                out.push_str("[待補引用]");
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::todo_red()),
+                        background_color: Some(BookPalette::warn_soft()),
+                        font_weight: Some(FontWeight::BOLD),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Russian { text } => {
+                let start = out.len();
+                out.push_str(text);
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::text_muted()),
+                        ..inherited
+                    },
+                ));
+            }
+            Inline::Macro { raw } => {
+                let start = out.len();
+                out.push_str(raw);
+                highlights.push((
+                    start..out.len(),
+                    HighlightStyle {
+                        color: Some(BookPalette::text_muted()),
+                        ..inherited
+                    },
+                ));
+            }
+        }
     }
+}
+
+fn has_style(s: &HighlightStyle) -> bool {
+    s.color.is_some()
+        || s.font_weight.is_some()
+        || s.font_style.is_some()
+        || s.background_color.is_some()
 }
