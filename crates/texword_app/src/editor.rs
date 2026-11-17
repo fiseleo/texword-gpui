@@ -15,7 +15,7 @@ use latex_ast::{
     parse_latex, serialize_block, serialize_latex,
 };
 use math_preview::{format_chem_unicode, math_to_plain_text, parse_math};
-use mcp_server::{EditorSharedState, EditorSyncEvent};
+use mcp_server::{EditorSharedState, EditorSyncEvent, run_latex_build};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -328,36 +328,12 @@ impl TexWordEditor {
 
         let shared = self.shared.clone();
         cx.spawn(async move |this, cx| {
-            let res = cx
+            let outcome = cx
                 .background_executor()
-                .spawn(async move {
-                    if cfg!(target_os = "windows") && root.join("build.cmd").exists() {
-                        std::process::Command::new("cmd")
-                            .current_dir(&root)
-                            .args(["/C", "build.cmd", "-Quick"])
-                            .output()
-                    } else {
-                        std::process::Command::new("xelatex")
-                            .current_dir(&root)
-                            .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
-                            .output()
-                    }
-                })
+                .spawn(async move { run_latex_build(&root, true) })
                 .await;
 
-            let summary = match res {
-                Ok(out) if out.status.success() => "XeLaTeX 快速編譯成功！".to_string(),
-                Ok(out) => {
-                    let err_msg = String::from_utf8_lossy(&out.stderr)
-                        .lines()
-                        .chain(String::from_utf8_lossy(&out.stdout).lines())
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("請檢視 main.log")
-                        .to_string();
-                    format!("編譯失敗（exit={}）：{err_msg}", out.status)
-                }
-                Err(e) => format!("找不到編譯器（xelatex / build.cmd）：{e}"),
-            };
+            let summary = outcome.summary;
 
             {
                 let mut guard = shared.write().await;

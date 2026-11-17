@@ -1,6 +1,8 @@
+pub mod compile;
 pub mod state;
 pub mod tools;
 
+pub use compile::{CompileOutcome, decode_console_bytes, find_xelatex_bin_dir, run_latex_build};
 pub use state::{EditorSharedState, EditorSyncEvent};
 pub use tools::TexWordMcpServer;
 

@@ -1,3 +1,4 @@
+use crate::compile::run_latex_build;
 use crate::state::{EditorSharedState, EditorSyncEvent};
 use latex_ast::{
     Block, BlockKind, MathEnv, inlines_plain_text, parse_latex, serialize_block, serialize_latex,
@@ -9,7 +10,6 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -371,7 +371,7 @@ impl TexWordMcpServer {
         &self,
         Parameters(CompilePdfArgs { quick }): Parameters<CompilePdfArgs>,
     ) -> Result<String, String> {
-        let (root_dir, has_build_cmd) = {
+        let root_dir = {
             let mut guard = self.state.write().await;
             if guard.dirty {
                 guard.save_active_to_disk().map_err(|e| e.to_string())?;
@@ -380,52 +380,21 @@ impl TexWordMcpServer {
                 return Err("尚未開啟書稿專案".to_string());
             };
             let root = project.root_dir.clone();
-            let has_cmd = root.join("build.cmd").exists();
             guard.push_log("[MCP] 開始執行 LaTeX 編譯...");
-            (root, has_cmd)
+            root
         };
 
         let quick_flag = quick.unwrap_or(true);
-        let output = tokio::task::spawn_blocking(move || {
-            if cfg!(target_os = "windows") && has_build_cmd {
-                let mut cmd = Command::new("cmd");
-                cmd.current_dir(&root_dir).arg("/C").arg("build.cmd");
-                if quick_flag {
-                    cmd.arg("-Quick");
-                }
-                cmd.output()
-            } else {
-                Command::new("xelatex")
-                    .current_dir(&root_dir)
-                    .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
-                    .output()
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let outcome = tokio::task::spawn_blocking(move || run_latex_build(&root_dir, quick_flag))
+            .await
+            .map_err(|e| e.to_string())?;
 
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let ok = out.status.success();
-                let summary = if ok {
-                    "編譯成功：main.pdf 已更新".to_string()
-                } else {
-                    format!("編譯失敗（exit={}）", out.status)
-                };
-                let mut guard = self.state.write().await;
-                guard.push_log(format!("[MCP] {summary}"));
-                Ok(format!(
-                    "{summary}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-                ))
-            }
-            Err(e) => {
-                let msg = format!("無法啟動編譯器（本機可能未安裝 xelatex / build.cmd 依賴）：{e}");
-                let mut guard = self.state.write().await;
-                guard.push_log(format!("[MCP] {msg}"));
-                Err(msg)
-            }
+        let mut guard = self.state.write().await;
+        guard.push_log(format!("[MCP] {}", outcome.summary));
+        if outcome.success {
+            Ok(format!("{}\n{}", outcome.summary, outcome.details))
+        } else {
+            Err(format!("{}\n{}", outcome.summary, outcome.details))
         }
     }
 }

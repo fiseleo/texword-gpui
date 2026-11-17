@@ -14,3 +14,4 @@ tokio-util.workspace = true
 axum.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+encoding_rs.workspace = true
